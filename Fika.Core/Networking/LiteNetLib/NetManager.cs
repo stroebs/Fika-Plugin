@@ -986,7 +986,7 @@ namespace LiteNetLib
 								SendRaw(NetConnectAcceptPacket.MakeNetworkChanged(netPeer), remoteEndPoint);
 								NetDebug.Write($"PeerNotFound sending connection info: {remoteEndPoint}");
 							}
-							else if (packet.Size == 2 && packet.RawData[1] == 1)
+							else if (packet.Size == 2 && packet.RawData.Length > 1 && packet.RawData[1] == 1)
 							{
 								//second reply
 								DisconnectPeerForce(netPeer, DisconnectReason.PeerNotFound, 0, null);
