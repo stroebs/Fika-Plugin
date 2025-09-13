@@ -858,45 +858,54 @@ namespace LiteNetLib
 				Statistics.AddBytesReceived(originalPacketSize);
 			}
 
-			if (_ntpRequests.Count > 0 && _ntpRequests.TryGetValue(remoteEndPoint, out var request))
+			try
 			{
-				if (packet.Size < 48)
+				if (_ntpRequests.Count > 0 && _ntpRequests.TryGetValue(remoteEndPoint, out var request))
 				{
-					NetDebug.Write(NetLogLevel.Trace, $"NTP response too short: {packet.Size}");
+					if (packet.Size < 48)
+					{
+						NetDebug.Write(NetLogLevel.Trace, $"NTP response too short: {packet.Size}");
+						return;
+					}
+
+					byte[] copiedData = new byte[packet.Size];
+					Buffer.BlockCopy(packet.RawData, 0, copiedData, 0, packet.Size);
+					NtpPacket ntpPacket = NtpPacket.FromServerResponse(copiedData, DateTime.UtcNow);
+					try
+					{
+						ntpPacket.ValidateReply();
+					}
+					catch (InvalidOperationException ex)
+					{
+						NetDebug.Write(NetLogLevel.Trace, $"NTP response error: {ex.Message}");
+						ntpPacket = null;
+					}
+
+					if (ntpPacket != null)
+					{
+						_ntpRequests.TryRemove(remoteEndPoint, out _);
+						_ntpEventListener?.OnNtpResponse(ntpPacket);
+					}
 					return;
 				}
 
-				byte[] copiedData = new byte[packet.Size];
-				Buffer.BlockCopy(packet.RawData, 0, copiedData, 0, packet.Size);
-				NtpPacket ntpPacket = NtpPacket.FromServerResponse(copiedData, DateTime.UtcNow);
-				try
+				if (_extraPacketLayer != null)
 				{
-					ntpPacket.ValidateReply();
-				}
-				catch (InvalidOperationException ex)
-				{
-					NetDebug.Write(NetLogLevel.Trace, $"NTP response error: {ex.Message}");
-					ntpPacket = null;
+					_extraPacketLayer.ProcessInboundPacket(ref remoteEndPoint, ref packet.RawData, ref packet.Size);
+					if (packet.Size == 0)
+						return;
 				}
 
-				if (ntpPacket != null)
+				if (!packet.Verify())
 				{
-					_ntpRequests.TryRemove(remoteEndPoint, out _);
-					_ntpEventListener?.OnNtpResponse(ntpPacket);
-				}
-				return;
-			}
-
-			if (_extraPacketLayer != null)
-			{
-				_extraPacketLayer.ProcessInboundPacket(ref remoteEndPoint, ref packet.RawData, ref packet.Size);
-				if (packet.Size == 0)
+					NetDebug.WriteError("[NM] DataReceived: bad!");
+					PoolRecycle(packet);
 					return;
+				}
 			}
-
-			if (!packet.Verify())
+			catch (Exception ex)
 			{
-				NetDebug.WriteError("[NM] DataReceived: bad!");
+				NetDebug.WriteError($"[NM] Malformed packet received from {remoteEndPoint}: {ex.Message}");
 				PoolRecycle(packet);
 				return;
 			}
@@ -905,9 +914,18 @@ namespace LiteNetLib
 			{
 				//special case connect request
 				case PacketProperty.ConnectRequest:
-					if (NetConnectRequestPacket.GetProtocolId(packet) != NetConstants.ProtocolId)
+					try
 					{
-						SendRawAndRecycle(PoolGetWithProperty(PacketProperty.InvalidProtocol), remoteEndPoint);
+						if (NetConnectRequestPacket.GetProtocolId(packet) != NetConstants.ProtocolId)
+						{
+							SendRawAndRecycle(PoolGetWithProperty(PacketProperty.InvalidProtocol), remoteEndPoint);
+							return;
+						}
+					}
+					catch (Exception ex)
+					{
+						NetDebug.WriteError($"[NM] Malformed ConnectRequest packet from {remoteEndPoint}: {ex.Message}");
+						PoolRecycle(packet);
 						return;
 					}
 					break;
@@ -940,69 +958,87 @@ namespace LiteNetLib
 			switch (packet.Property)
 			{
 				case PacketProperty.ConnectRequest:
-					var connRequest = NetConnectRequestPacket.FromData(packet);
-					if (connRequest != null)
-						ProcessConnectRequest(remoteEndPoint, netPeer, connRequest);
+					try
+					{
+						var connRequest = NetConnectRequestPacket.FromData(packet);
+						if (connRequest != null)
+							ProcessConnectRequest(remoteEndPoint, netPeer, connRequest);
+					}
+					catch (Exception ex)
+					{
+						NetDebug.WriteError($"[NM] Malformed ConnectRequest packet from {remoteEndPoint}: {ex.Message}");
+						PoolRecycle(packet);
+						return;
+					}
 					break;
 				case PacketProperty.PeerNotFound:
-					if (peerFound) //local
+					try
 					{
-						if (netPeer.ConnectionState != ConnectionState.Connected)
-							return;
-						if (packet.Size == 1)
+						if (peerFound) //local
 						{
-							//first reply
-							//send NetworkChanged packet
-							netPeer.ResetMtu();
-							SendRaw(NetConnectAcceptPacket.MakeNetworkChanged(netPeer), remoteEndPoint);
-							NetDebug.Write($"PeerNotFound sending connection info: {remoteEndPoint}");
-						}
-						else if (packet.Size == 2 && packet.RawData[1] == 1)
-						{
-							//second reply
-							DisconnectPeerForce(netPeer, DisconnectReason.PeerNotFound, 0, null);
-						}
-					}
-					else if (packet.Size > 1) //remote
-					{
-						//check if this is old peer
-						bool isOldPeer = false;
-
-						if (AllowPeerAddressChange)
-						{
-							NetDebug.Write($"[NM] Looks like address change: {packet.Size}");
-							var remoteData = NetConnectAcceptPacket.FromData(packet);
-							if (remoteData != null &&
-								remoteData.PeerNetworkChanged &&
-								remoteData.PeerId < _peersArray.Length)
+							if (netPeer.ConnectionState != ConnectionState.Connected)
+								return;
+							if (packet.Size == 1)
 							{
-								_peersLock.EnterUpgradeableReadLock();
-								var peer = _peersArray[remoteData.PeerId];
-								_peersLock.ExitUpgradeableReadLock();
-								if (peer != null &&
-									peer.ConnectTime == remoteData.ConnectionTime &&
-									peer.ConnectionNum == remoteData.ConnectionNumber)
-								{
-									if (peer.ConnectionState == ConnectionState.Connected)
-									{
-										peer.InitiateEndPointChange();
-										CreateEvent(NetEvent.EType.PeerAddressChanged, peer, remoteEndPoint);
-										NetDebug.Write("[NM] PeerNotFound change address of remote peer");
-									}
-									isOldPeer = true;
-								}
+								//first reply
+								//send NetworkChanged packet
+								netPeer.ResetMtu();
+								SendRaw(NetConnectAcceptPacket.MakeNetworkChanged(netPeer), remoteEndPoint);
+								NetDebug.Write($"PeerNotFound sending connection info: {remoteEndPoint}");
+							}
+							else if (packet.Size == 2 && packet.RawData.Length > 1 && packet.RawData[1] == 1)
+							{
+								//second reply
+								DisconnectPeerForce(netPeer, DisconnectReason.PeerNotFound, 0, null);
 							}
 						}
-
-						PoolRecycle(packet);
-
-						//else peer really not found
-						if (!isOldPeer)
+						else if (packet.Size > 1) //remote
 						{
-							var secondResponse = PoolGetWithProperty(PacketProperty.PeerNotFound, 1);
-							secondResponse.RawData[1] = 1;
-							SendRawAndRecycle(secondResponse, remoteEndPoint);
+							//check if this is old peer
+							bool isOldPeer = false;
+
+							if (AllowPeerAddressChange)
+							{
+								NetDebug.Write($"[NM] Looks like address change: {packet.Size}");
+								var remoteData = NetConnectAcceptPacket.FromData(packet);
+								if (remoteData != null &&
+									remoteData.PeerNetworkChanged &&
+									remoteData.PeerId < _peersArray.Length)
+								{
+									_peersLock.EnterUpgradeableReadLock();
+									var peer = _peersArray[remoteData.PeerId];
+									_peersLock.ExitUpgradeableReadLock();
+									if (peer != null &&
+										peer.ConnectTime == remoteData.ConnectionTime &&
+										peer.ConnectionNum == remoteData.ConnectionNumber)
+									{
+										if (peer.ConnectionState == ConnectionState.Connected)
+										{
+											peer.InitiateEndPointChange();
+											CreateEvent(NetEvent.EType.PeerAddressChanged, peer, remoteEndPoint);
+											NetDebug.Write("[NM] PeerNotFound change address of remote peer");
+										}
+										isOldPeer = true;
+									}
+								}
+							}
+
+							PoolRecycle(packet);
+
+							//else peer really not found
+							if (!isOldPeer)
+							{
+								var secondResponse = PoolGetWithProperty(PacketProperty.PeerNotFound, 1);
+								secondResponse.RawData[1] = 1;
+								SendRawAndRecycle(secondResponse, remoteEndPoint);
+							}
 						}
+					}
+					catch (Exception ex)
+					{
+						NetDebug.WriteError($"[NM] Malformed PeerNotFound packet from {remoteEndPoint}: {ex.Message}");
+						PoolRecycle(packet);
+						return;
 					}
 					break;
 				case PacketProperty.InvalidProtocol:
@@ -1035,15 +1071,33 @@ namespace LiteNetLib
 				case PacketProperty.ConnectAccept:
 					if (!peerFound)
 						return;
-					var connAccept = NetConnectAcceptPacket.FromData(packet);
-					if (connAccept != null && netPeer.ProcessConnectAccept(connAccept))
-						CreateEvent(NetEvent.EType.Connect, netPeer);
+					try
+					{
+						var connAccept = NetConnectAcceptPacket.FromData(packet);
+						if (connAccept != null && netPeer.ProcessConnectAccept(connAccept))
+							CreateEvent(NetEvent.EType.Connect, netPeer);
+					}
+					catch (Exception ex)
+					{
+						NetDebug.WriteError($"[NM] Malformed ConnectAccept packet from {remoteEndPoint}: {ex.Message}");
+						PoolRecycle(packet);
+						return;
+					}
 					break;
 				default:
-					if (peerFound)
-						netPeer.ProcessPacket(packet);
-					else
-						SendRawAndRecycle(PoolGetWithProperty(PacketProperty.PeerNotFound), remoteEndPoint);
+					try
+					{
+						if (peerFound)
+							netPeer.ProcessPacket(packet);
+						else
+							SendRawAndRecycle(PoolGetWithProperty(PacketProperty.PeerNotFound), remoteEndPoint);
+					}
+					catch (Exception ex)
+					{
+						NetDebug.WriteError($"[NM] Malformed packet from {remoteEndPoint}: {ex.Message}");
+						PoolRecycle(packet);
+						return;
+					}
 					break;
 			}
 		}
